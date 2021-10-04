@@ -1,0 +1,14 @@
+<package format="3">
+    <name>rosbag_extract_video</name>
+    <description>Extract video files from rosbags</description>
+    <version>0.0.1</version>
+    <license>MIT</license>
+    <maintainer email="max.schwarz@ais.uni-bonn.de">Max Schwarz</maintainer>
+
+    <buildtool_depend>catkin</buildtool_depend>
+    <depend>rosbag</depend>
+    <depend>ffmpeg</depend>
+    <depend>rosfmt</depend>
+    <depend>sensor_msgs</depend>
+    <depend>libturbojpeg</depend>
+</package>
