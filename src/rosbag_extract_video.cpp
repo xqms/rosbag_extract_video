@@ -90,6 +90,7 @@ std::string averror(int code) {
 const std::map<std::string, AVCodecID> CODECS = {{"jpeg", AV_CODEC_ID_MJPEG},
                                                  {"jpg", AV_CODEC_ID_MJPEG},
                                                  {"h264", AV_CODEC_ID_H264},
+                                                 {"hevc", AV_CODEC_ID_HEVC},
                                                  {"h265", AV_CODEC_ID_HEVC}};
 
 const std::map<std::string, AVPixelFormat> RAW_PIXEL_FORMATS = {
@@ -265,6 +266,8 @@ int main(int argc, char **argv) {
   {
     AVCodecContext *codecCtx{};
     final_act _deallocParser([&] { avcodec_free_context(&codecCtx); });
+    AVFrame *decodedFrame = av_frame_alloc();
+    final_act _deallocDecodedFrame([&] { av_frame_free(&decodedFrame); });
 
     for (auto &msg : view) {
       if (auto imgMsg = msg.instantiate<sensor_msgs::CompressedImage>()) {
@@ -314,13 +317,40 @@ int main(int argc, char **argv) {
         packet->pts = rosPTS.toNSec();
         packet->dts = rosPTS.toNSec();
 
-        if (avcodec_send_packet(codecCtx, packet) != 0) {
-          fmt::print(stderr, "Could not send packet to decoder");
-          return 1;
+        int sendRet = avcodec_send_packet(codecCtx, packet);
+        if (sendRet < 0) {
+          // Some streams (notably HEVC) can contain packets that are not
+          // decodable in isolation. Keep scanning until we can parse one.
+          fmt::print(stderr, "Warning: Could not parse probe packet: {}\n",
+                     averror(sendRet));
+          av_packet_unref(packet);
+          continue;
         }
 
-        if (codecCtx->width > 0 && codecCtx->height > 0) {
-          avcodec_parameters_from_context(stream->codecpar, codecCtx);
+        while (true) {
+          int recvRet = avcodec_receive_frame(codecCtx, decodedFrame);
+          if (recvRet == 0) {
+            av_frame_unref(decodedFrame);
+
+            if (codecCtx->width > 0 && codecCtx->height > 0) {
+              avcodec_parameters_from_context(stream->codecpar, codecCtx);
+              break;
+            }
+
+            continue;
+          }
+
+          if (recvRet == AVERROR(EAGAIN) || recvRet == AVERROR_EOF)
+            break;
+
+          fmt::print(stderr, "Warning: Decoder probe failed: {}\n",
+                     averror(recvRet));
+          break;
+        }
+
+        av_packet_unref(packet);
+
+        if (stream->codecpar->width > 0 && stream->codecpar->height > 0) {
           break;
         }
       } else if (auto imgMsg = msg.instantiate<sensor_msgs::Image>()) {
