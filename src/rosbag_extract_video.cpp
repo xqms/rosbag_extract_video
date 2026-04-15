@@ -106,6 +106,9 @@ int main(int argc, char **argv) {
   desc.add_options()("help", "This help message")
       ("topic", po::value<std::string>()->required(), "Topic to extract")
       ("output", po::value<std::string>()->value_name("out.mp4")->required(), "Output file")
+      ("start", po::value<double>(), "Start time in seconds from bag start")
+      ("end", po::value<double>(), "End time in seconds from bag start. Cannot be used together with --duration")
+      ("duration,d", po::value<double>(), "Duration in seconds after start. Cannot be used together with --end")
   ;
   // clang-format on
 
@@ -180,7 +183,69 @@ int main(int argc, char **argv) {
 
   rosbag::Bag bag{bagFilename};
 
-  rosbag::View view{bag, rosbag::TopicQuery{vm["topic"].as<std::string>()}};
+  rosbag::View allMessages{bag};
+  ros::Time bagBegin = allMessages.getBeginTime();
+  ros::Time bagEnd = allMessages.getEndTime();
+
+  ros::Time viewBegin = bagBegin;
+  ros::Time viewEnd = bagEnd;
+
+  if (vm.count("duration") && vm.count("end")) {
+    fmt::print(stderr, "Error: --duration/--d cannot be used together with --end\n");
+    return 1;
+  }
+
+  if (vm.count("start")) {
+    double startSeconds = vm["start"].as<double>();
+    if (startSeconds < 0.0) {
+      fmt::print(stderr, "Error: --start must be >= 0\n");
+      return 1;
+    }
+    if (bagBegin + ros::Duration(startSeconds) > bagEnd) {
+      fmt::print(stderr, "Error: --start ({} seconds) is beyond the end of the bag ({})\n", startSeconds, bagEnd.toSec());
+      return 1;
+    }
+
+    viewBegin = bagBegin + ros::Duration(startSeconds);
+  }
+
+  if (vm.count("end")) {
+    double endSeconds = vm["end"].as<double>();
+    if (endSeconds < 0.0) {
+      fmt::print(stderr, "Error: --end must be >= 0\n");
+      return 1;
+    }
+    if (bagBegin + ros::Duration(endSeconds) < bagBegin) {
+      fmt::print(stderr, "Error: --end ({} seconds) is before the start of the bag ({})\n", endSeconds, bagBegin.toSec());
+      return 1;
+    }
+    viewEnd = bagBegin + ros::Duration(endSeconds);
+  }
+
+  if (vm.count("duration")) {
+    double durationSeconds = vm["duration"].as<double>();
+    if (durationSeconds < 0.0) {
+      fmt::print(stderr, "Error: --duration must be >= 0\n");
+      return 1;
+    }
+
+    viewEnd = viewBegin + ros::Duration(durationSeconds);
+    if (viewEnd > bagEnd) {
+      fmt::print(
+          stderr,
+          "Error: --duration end ({} seconds from bag start) is beyond the end of the bag ({})\n",
+          (viewEnd - bagBegin).toSec(), bagEnd.toSec());
+      return 1;
+    }
+  }
+
+  if (viewEnd < viewBegin) {
+    fmt::print(stderr, "Error: --end must be >= --start\n");
+    return 1;
+  }
+
+  rosbag::View view{bag, rosbag::TopicQuery{vm["topic"].as<std::string>()},
+                    viewBegin, viewEnd};
 
   AVPacket *packet = av_packet_alloc();
   final_act _deallocPacket([&] { av_packet_free(&packet); });
