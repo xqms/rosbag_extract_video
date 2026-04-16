@@ -90,6 +90,7 @@ std::string averror(int code) {
 const std::map<std::string, AVCodecID> CODECS = {{"jpeg", AV_CODEC_ID_MJPEG},
                                                  {"jpg", AV_CODEC_ID_MJPEG},
                                                  {"h264", AV_CODEC_ID_H264},
+                                                 {"hevc", AV_CODEC_ID_HEVC},
                                                  {"h265", AV_CODEC_ID_HEVC}};
 
 const std::map<std::string, AVPixelFormat> RAW_PIXEL_FORMATS = {
@@ -106,6 +107,9 @@ int main(int argc, char **argv) {
   desc.add_options()("help", "This help message")
       ("topic", po::value<std::string>()->required(), "Topic to extract")
       ("output", po::value<std::string>()->value_name("out.mp4")->required(), "Output file")
+      ("start", po::value<double>(), "Start time in seconds from bag start")
+      ("end", po::value<double>(), "End time in seconds from bag start. Cannot be used together with --duration")
+      ("duration,d", po::value<double>(), "Duration in seconds after start. Cannot be used together with --end")
   ;
   // clang-format on
 
@@ -180,7 +184,69 @@ int main(int argc, char **argv) {
 
   rosbag::Bag bag{bagFilename};
 
-  rosbag::View view{bag, rosbag::TopicQuery{vm["topic"].as<std::string>()}};
+  rosbag::View allMessages{bag};
+  ros::Time bagBegin = allMessages.getBeginTime();
+  ros::Time bagEnd = allMessages.getEndTime();
+
+  ros::Time viewBegin = bagBegin;
+  ros::Time viewEnd = bagEnd;
+
+  if (vm.count("duration") && vm.count("end")) {
+    fmt::print(stderr, "Error: --duration/--d cannot be used together with --end\n");
+    return 1;
+  }
+
+  if (vm.count("start")) {
+    double startSeconds = vm["start"].as<double>();
+    if (startSeconds < 0.0) {
+      fmt::print(stderr, "Error: --start must be >= 0\n");
+      return 1;
+    }
+    if (bagBegin + ros::Duration(startSeconds) > bagEnd) {
+      fmt::print(stderr, "Error: --start ({} seconds) is beyond the end of the bag ({})\n", startSeconds, bagEnd.toSec());
+      return 1;
+    }
+
+    viewBegin = bagBegin + ros::Duration(startSeconds);
+  }
+
+  if (vm.count("end")) {
+    double endSeconds = vm["end"].as<double>();
+    if (endSeconds < 0.0) {
+      fmt::print(stderr, "Error: --end must be >= 0\n");
+      return 1;
+    }
+    if (bagBegin + ros::Duration(endSeconds) < bagBegin) {
+      fmt::print(stderr, "Error: --end ({} seconds) is before the start of the bag ({})\n", endSeconds, bagBegin.toSec());
+      return 1;
+    }
+    viewEnd = bagBegin + ros::Duration(endSeconds);
+  }
+
+  if (vm.count("duration")) {
+    double durationSeconds = vm["duration"].as<double>();
+    if (durationSeconds < 0.0) {
+      fmt::print(stderr, "Error: --duration must be >= 0\n");
+      return 1;
+    }
+
+    viewEnd = viewBegin + ros::Duration(durationSeconds);
+    if (viewEnd > bagEnd) {
+      fmt::print(
+          stderr,
+          "Error: --duration end ({} seconds from bag start) is beyond the end of the bag ({})\n",
+          (viewEnd - bagBegin).toSec(), bagEnd.toSec());
+      return 1;
+    }
+  }
+
+  if (viewEnd < viewBegin) {
+    fmt::print(stderr, "Error: --end must be >= --start\n");
+    return 1;
+  }
+
+  rosbag::View view{bag, rosbag::TopicQuery{vm["topic"].as<std::string>()},
+                    viewBegin, viewEnd};
 
   AVPacket *packet = av_packet_alloc();
   final_act _deallocPacket([&] { av_packet_free(&packet); });
@@ -200,6 +266,8 @@ int main(int argc, char **argv) {
   {
     AVCodecContext *codecCtx{};
     final_act _deallocParser([&] { avcodec_free_context(&codecCtx); });
+    AVFrame *decodedFrame = av_frame_alloc();
+    final_act _deallocDecodedFrame([&] { av_frame_free(&decodedFrame); });
 
     for (auto &msg : view) {
       if (auto imgMsg = msg.instantiate<sensor_msgs::CompressedImage>()) {
@@ -249,13 +317,40 @@ int main(int argc, char **argv) {
         packet->pts = rosPTS.toNSec();
         packet->dts = rosPTS.toNSec();
 
-        if (avcodec_send_packet(codecCtx, packet) != 0) {
-          fmt::print(stderr, "Could not send packet to decoder");
-          return 1;
+        int sendRet = avcodec_send_packet(codecCtx, packet);
+        if (sendRet < 0) {
+          // Some streams (notably HEVC) can contain packets that are not
+          // decodable in isolation. Keep scanning until we can parse one.
+          fmt::print(stderr, "Warning: Could not parse probe packet: {}\n",
+                     averror(sendRet));
+          av_packet_unref(packet);
+          continue;
         }
 
-        if (codecCtx->width > 0 && codecCtx->height > 0) {
-          avcodec_parameters_from_context(stream->codecpar, codecCtx);
+        while (true) {
+          int recvRet = avcodec_receive_frame(codecCtx, decodedFrame);
+          if (recvRet == 0) {
+            av_frame_unref(decodedFrame);
+
+            if (codecCtx->width > 0 && codecCtx->height > 0) {
+              avcodec_parameters_from_context(stream->codecpar, codecCtx);
+              break;
+            }
+
+            continue;
+          }
+
+          if (recvRet == AVERROR(EAGAIN) || recvRet == AVERROR_EOF)
+            break;
+
+          fmt::print(stderr, "Warning: Decoder probe failed: {}\n",
+                     averror(recvRet));
+          break;
+        }
+
+        av_packet_unref(packet);
+
+        if (stream->codecpar->width > 0 && stream->codecpar->height > 0) {
           break;
         }
       } else if (auto imgMsg = msg.instantiate<sensor_msgs::Image>()) {
